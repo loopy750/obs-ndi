@@ -123,6 +123,14 @@ static uyvy_conv_function get_convert_function(video_format format)
 	return nullptr;
 }
 
+uint8_t* copy_video(uint8_t* source_video, size_t linesize, uint32_t video_height)
+{
+	size_t data_size = linesize * (size_t)video_height;
+	uint8_t* dest = (uint8_t*)bmalloc(data_size);
+	memcpy(dest, source_video, data_size);
+	return dest;
+}
+
 struct ndi_output
 {
 	obs_output_t *output;
@@ -138,6 +146,10 @@ struct ndi_output
 
 	size_t audio_channels;
 	uint32_t audio_samplerate;
+
+	struct circlebuf video_queue;
+	int last_audio_buffering_video_frames;
+	int audio_buffering_video_frames;
 
 	uint8_t* conv_buffer;
 	uint32_t conv_linesize;
@@ -226,6 +238,8 @@ bool ndi_output_start(void* data)
 	if (audio) {
 		o->audio_samplerate = audio_output_get_sample_rate(audio);
 		o->audio_channels = audio_output_get_channels(audio);
+		o->last_audio_buffering_video_frames = 0;
+		o->audio_buffering_video_frames = 0;
 		flags |= OBS_OUTPUT_AUDIO;
 	}
 
@@ -257,6 +271,12 @@ void ndi_output_stop(void* data, uint64_t ts)
 	o->started = false;
 	obs_output_end_data_capture(o->output);
 
+	while (o->video_queue.start_pos != o->video_queue.end_pos) {
+		NDIlib_video_frame_v2_t frame;
+		circlebuf_pop_front(&o->video_queue, &frame, sizeof(NDIlib_video_frame_v2_t));
+		bfree(frame.p_data);
+	}
+
 	ndiLib->NDIlib_send_destroy(o->ndi_sender);
 	delete o->conv_buffer;
 	o->conv_function = nullptr;
@@ -280,6 +300,7 @@ void* ndi_output_create(obs_data_t* settings, obs_output_t* output)
 	auto o = (struct ndi_output*)bzalloc(sizeof(struct ndi_output));
 	o->output = output;
 	o->started = false;
+	circlebuf_init(&o->video_queue);
 	ndi_output_update(o, settings);
 	return o;
 }
@@ -287,6 +308,7 @@ void* ndi_output_create(obs_data_t* settings, obs_output_t* output)
 void ndi_output_destroy(void* data)
 {
 	auto o = (struct ndi_output*)data;
+	circlebuf_free(&o->video_queue);
 	bfree(o);
 }
 
@@ -297,32 +319,55 @@ void ndi_output_rawvideo(void* data, struct video_data* frame)
 	if (!o->started || !o->frame_width || !o->frame_height)
 		return;
 
-	uint32_t width = o->frame_width;
-	uint32_t height = o->frame_height;
+	{
+		uint32_t width = o->frame_width;
+		uint32_t height = o->frame_height;
 
-	NDIlib_video_frame_v2_t video_frame = {0};
-	video_frame.xres = width;
-	video_frame.yres = height;
-	video_frame.frame_rate_N = (int)(o->video_framerate * 100);
-	video_frame.frame_rate_D = 100;
-	video_frame.picture_aspect_ratio = (float)width / (float)height;
-	video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
-	video_frame.timecode = (int64_t)(frame->timestamp / 100.0);
+		NDIlib_video_frame_v2_t video_frame = { 0 };
+		video_frame.xres = width;
+		video_frame.yres = height;
+		video_frame.frame_rate_N = (int)(o->video_framerate * 100);
+		video_frame.frame_rate_D = 100;
+		video_frame.picture_aspect_ratio = (float)width / (float)height;
+		video_frame.frame_format_type = NDIlib_frame_format_type_progressive;
+		video_frame.timecode = (int64_t)(frame->timestamp / 100.0);
 
-	video_frame.FourCC = o->frame_fourcc;
-	if (video_frame.FourCC == NDIlib_FourCC_type_UYVY) {
-		o->conv_function(frame->data, frame->linesize,
-							 0, height,
-							 o->conv_buffer, o->conv_linesize);
-		video_frame.p_data = o->conv_buffer;
-		video_frame.line_stride_in_bytes = o->conv_linesize;
+		video_frame.FourCC = o->frame_fourcc;
+		if (video_frame.FourCC == NDIlib_FourCC_type_UYVY) {
+			o->conv_function(frame->data, frame->linesize,
+				0, height,
+				o->conv_buffer, o->conv_linesize);
+			video_frame.p_data = o->conv_buffer;
+			video_frame.line_stride_in_bytes = o->conv_linesize;
+		}
+		else {
+			video_frame.p_data = frame->data[0];
+			video_frame.line_stride_in_bytes = frame->linesize[0];
+		}
+
+		// Copy frame to queue
+		video_frame.p_data = copy_video(video_frame.p_data, video_frame.line_stride_in_bytes, video_frame.yres);
+		circlebuf_push_back(&o->video_queue, &video_frame, sizeof(NDIlib_video_frame_v2_t));
+
+		// Compensate A/V delay
+		if (o->audio_buffering_video_frames > o->last_audio_buffering_video_frames) {
+			int difference = o->audio_buffering_video_frames - o->last_audio_buffering_video_frames;
+			blog(LOG_INFO, "output: compensating %lld frames of audio buffering", difference);
+			for (size_t i = 0; i < difference; ++i) {
+				video_frame.p_data = copy_video(video_frame.p_data, video_frame.line_stride_in_bytes, video_frame.yres);
+				circlebuf_push_back(&o->video_queue, &video_frame, sizeof(NDIlib_video_frame_v2_t));
+			}
+			o->last_audio_buffering_video_frames = o->audio_buffering_video_frames;
+		}
 	}
-	else {
-		video_frame.p_data = frame->data[0];
-		video_frame.line_stride_in_bytes = frame->linesize[0];
+	
+	// Send front frame from circlebuffer over NDI
+	if (o->video_queue.start_pos != o->video_queue.end_pos) {
+		NDIlib_video_frame_v2_t actual_frame;
+		circlebuf_pop_front(&o->video_queue, &actual_frame, sizeof(NDIlib_video_frame_v2_t));
+		ndiLib->NDIlib_send_send_video_v2(o->ndi_sender, &actual_frame);
+		bfree(actual_frame.p_data);
 	}
-
-	ndiLib->NDIlib_send_send_video_v2(o->ndi_sender, &video_frame);
 }
 
 void ndi_output_rawaudio(void* data, struct audio_data* frame)
@@ -350,6 +395,11 @@ void ndi_output_rawaudio(void* data, struct audio_data* frame)
 
 	audio_frame.p_data = (float*)audio_data;
 	audio_frame.timecode = (int64_t)(frame->timestamp / 100);
+
+	if (o->video_framerate > 0.0) {
+		uint64_t audio_buffering = (os_gettime_ns() - frame->timestamp);
+		o->audio_buffering_video_frames = (audio_buffering / (uint64_t)((double)1000000000.0 / o->video_framerate));
+	}
 
 	ndiLib->NDIlib_send_send_audio_v2(o->ndi_sender, &audio_frame);
 	bfree(audio_data);
