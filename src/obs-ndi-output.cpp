@@ -398,7 +398,7 @@ void ndi_output_rawaudio(void* data, struct audio_data* frame)
 
 	if (o->video_framerate > 0.0) {
 		uint64_t audio_buffering = (os_gettime_ns() - frame->timestamp);
-		o->audio_buffering_video_frames = (audio_buffering / (uint64_t)((double)1000000000.0 / o->video_framerate));
+		o->audio_buffering_video_frames = (audio_buffering / (uint64_t)ceil((double)1000000000.0 / o->video_framerate));
 	}
 
 	ndiLib->NDIlib_send_send_audio_v2(o->ndi_sender, &audio_frame);
