@@ -15,8 +15,7 @@ sudo installer -pkg ./Packages.pkg -target /
 brew update
 # OBS Studio + obs-websocket deps
 brew install ffmpeg libav
-brew install qt5
-#echo "Qt path: $(find /usr/local/Cellar/qt5 -d 1 | tail -n 1)"
+brew install ./obs-ndi/CI/macos/qt.rb
 
 # Build OBS Studio
 git clone --recursive https://github.com/jp9000/obs-studio.git
